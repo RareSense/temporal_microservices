@@ -1,0 +1,9 @@
+fastapi==0.110.*
+uvicorn[standard]==0.29.*
+gunicorn==21.*
+torch==2.3.*
+torchvision==0.18.*
+timm==0.9.*
+structlog==24.*
+httpx==0.27.*
+pillow

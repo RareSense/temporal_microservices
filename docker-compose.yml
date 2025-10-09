@@ -1,0 +1,19 @@
+version: "3.9"
+
+x-common-env: &common-env
+  OMP_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+
+services:
+  jewelry-classify:
+    build:
+      context: .
+      target: jewelry-classify      
+    image: jewelry-classify:1.0.0
+    environment:
+      <<: *common-env
+      CKPT_PATH: /weights/best_model.pth
+    volumes:
+      - ./weights:/weights:ro
+    ports:
+      - "18006:8000"          
