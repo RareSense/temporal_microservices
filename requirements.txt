@@ -1,9 +1,8 @@
-fastapi==0.110.*
-uvicorn[standard]==0.29.*
-gunicorn==21.*
-torch==2.3.*
-torchvision==0.18.*
-timm==0.9.*
-structlog==24.*
-httpx==0.27.*
-pillow
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+torch==2.3.0           # or CPU-only torch==2.3.0+cpu
+timm==1.0.3
+pillow>=10
+python-magic-bin; sys_platform == "win32"
+python-magic; sys_platform != "win32"
+azure-storage-blob>=12.20.0     # only if you need artifact downloads
