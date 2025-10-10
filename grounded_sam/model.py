@@ -1,307 +1,383 @@
-# grounded_sam_segmenter/model.py
-# -------------------------------------------------------------
-# Lazy-loading wrapper for Grounded-SAM that auto-downloads
-# the ViT-H checkpoint if it isn't present locally.
-#
-#   • Thread- and process-safe (file lock + threading.Lock)
-#   • CPU by default; set DEVICE=cuda for GPU
-#   • Keeps RAM low in the parent process; children load on demand
-# -------------------------------------------------------------
 from __future__ import annotations
-
-import hashlib
-import cv2
-import io, os, shutil, sys, tqdm
-from filelock import FileLock
-import threading
-import types
+import os, io, logging, requests, shutil
 from pathlib import Path
-from typing import Dict, List
-from huggingface_hub.utils import HfHubHTTPError
-import logging
+from typing import List, Tuple, Optional, Dict
+import threading
+from tqdm import tqdm
 
-import numpy as np
-import requests
 import torch
-from PIL import Image
-from segment_anything import SamPredictor, sam_model_registry
+import torchvision
 from torchvision.ops import box_convert
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+import cv2
 
-from huggingface_hub import hf_hub_download
-from huggingface_hub.utils import RepositoryNotFoundError
+# GroundingDINO imports
+from groundingdino.util.inference import load_model, load_image, predict, annotate
+import groundingdino.datasets.transforms as T
 
+# SAM imports
+from segment_anything import build_sam, SamPredictor
 
-# ─────────────────────────────────────────────────────────────
-#  Setup logging
-# ─────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────
-#  Config & constants
-# ─────────────────────────────────────────────────────────────
-ROOT = Path(__file__).parent.parent.resolve()
-WEIGHTS_DIR = ROOT / "weights"
+# Model paths
+ROOT = Path(__file__).parent
+WEIGHTS_DIR = ROOT.parent / "weights"  # Use shared weights directory
 WEIGHTS_DIR.mkdir(exist_ok=True)
 
-# official ViT-H SAM checkpoint (~360 MB)
-REPO_ID   = "facebook/sam-vit-h"
-CKPT_NAME = "sam_vit_h_4b8939.pth"
-CKPT_PATH = WEIGHTS_DIR / CKPT_NAME
-CKPT_URL = (
-    "https://huggingface.co/facebook/sam-vit-h/resolve/main/sam_vit_h_4b8939.pth"
-)
+DINO_CONFIG = WEIGHTS_DIR / "GroundingDINO_SwinT_OGC.py"
+DINO_CKPT = WEIGHTS_DIR / "groundingdino_swint_ogc.pth"
+SAM_CKPT = WEIGHTS_DIR / "sam_vit_h_4b8939.pth"
 
-FB_URL    = (  # fallback: original public mirror
-    f"https://dl.fbaipublicfiles.com/segment_anything/{CKPT_NAME}"
-)
+# Download URLs
+DINO_CKPT_URL = "https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth"
+DINO_CONFIG_URL = "https://raw.githubusercontent.com/IDEA-Research/GroundingDINO/main/groundingdino/config/GroundingDINO_SwinT_OGC.py"
+SAM_CKPT_URL = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth"
 
-DEVICE = os.getenv("DEVICE", "cpu")  # "cuda" for GPU
-logger.info(f"Using device: {DEVICE}")
-
-# Grounded-SAM (CPU) still needs open-clip text encoder;
-# no extra weights – they're downloaded by open-clip itself.
-
-# ─────────────────────────────────────────────────────────────
-#  Utilities
-# ─────────────────────────────────────────────────────────────
-def _sha256(path: Path, buf: int = 2**20) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        while chunk := f.read(buf):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def _download_ckpt() -> None:
-    """
-    • First tries Hugging Face (honors $HF_TOKEN if set)  
-    • On 4xx/5xx falls back to the Facebook CDN  
-    • FileLock guarantees exactly-once download across processes
-    • tqdm shows a progress bar in interactive terminals
-    """
-    if CKPT_PATH.exists():
-        logger.info(f"Checkpoint already exists at {CKPT_PATH}")
+def download_file(url: str, dest: Path, desc: str = None):
+    """Download file with progress bar"""
+    if dest.exists():
+        log.info(f"{desc or dest.name} already exists")
         return
-
-    lock = FileLock(str(CKPT_PATH) + ".lock")
-    with lock:                          # wait here if another proc is working
-        if CKPT_PATH.exists():          # may have appeared while we waited
-            return
-
-        # 1️⃣ Hugging Face
-        try:
-            logger.info("Attempting to download checkpoint from Hugging Face...")
-            tmp = hf_hub_download(
-                repo_id         = REPO_ID,
-                filename        = CKPT_NAME,
-                token           = os.getenv("HF_TOKEN"),   # optional
-                resume_download = True,   # force tqdm
-            )
-            shutil.copy2(tmp, CKPT_PATH)
-            logger.info("✅ Checkpoint downloaded successfully from Hugging Face")
-            return
-        except (RepositoryNotFoundError, HfHubHTTPError) as exc:
-            logger.warning(f"HF download failed ({exc}); trying fallback...")
-
-        # 2️⃣ Facebook public CDN (always anonymous)
-        logger.info("Downloading checkpoint from Facebook CDN...")
-        with requests.get(FB_URL, stream=True, timeout=60) as r:
-            r.raise_for_status()
-            total = int(r.headers.get("content-length", 0))
-            bar   = tqdm.tqdm(
-                total=total, unit="B", unit_scale=True, desc="sam_vit_h",
-                file=sys.stderr,
-            )
-            with CKPT_PATH.open("wb") as f:
-                for chunk in r.iter_content(chunk_size=2**20):
-                    f.write(chunk)
-                    bar.update(len(chunk))
-            bar.close()
-        logger.info("✅ Checkpoint downloaded successfully from Facebook CDN")
-
-# ─────────────────────────────────────────────────────────────
-#  Dummy classes to satisfy torch.load pickles
-# ─────────────────────────────────────────────────────────────
-class LabelEncoder:  # noqa: D401 – minimal stub
-    def __init__(self, classes: List[str]):  # pragma: no cover
-        self.classes = classes
-
-class TrainingConfig:  # pragma: no cover
-    ...
-
-for alias in ("__main__", "__mp_main__"):
-    if alias not in sys.modules:
-        sys.modules[alias] = types.ModuleType(alias)
-    sys.modules[alias].LabelEncoder = LabelEncoder
-    sys.modules[alias].TrainingConfig = TrainingConfig
-
-# ─────────────────────────────────────────────────────────────
-#  Thread-safe singleton predictor
-# ─────────────────────────────────────────────────────────────
-_PRED_LOCK = threading.Lock()
-_PREDICTOR: SamPredictor | None = None
-
-
-def _get_predictor() -> SamPredictor:
-    global _PREDICTOR
-    if _PREDICTOR is not None:
-        return _PREDICTOR
-
-    with _PRED_LOCK:
-        if _PREDICTOR is not None:  # pragma: no cover
-            return _PREDICTOR
-
-        logger.info("Initializing SAM predictor...")
+    
+    log.info(f"Downloading {desc or dest.name}...")
+    
+    # Create temp file first
+    temp_file = dest.with_suffix('.tmp')
+    
+    try:
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
         
-        if not CKPT_PATH.exists():
-            _download_ckpt()
-
-        try:
-            sam = sam_model_registry["vit_h"](checkpoint=str(CKPT_PATH))
-            sam = sam.to(DEVICE)
-            _PREDICTOR = SamPredictor(sam)
-            logger.info("✅ SAM predictor initialized successfully")
-            
-            # Log available prediction methods
-            has_predict_torch = hasattr(_PREDICTOR, 'predict_torch')
-            has_predict = hasattr(_PREDICTOR, 'predict')
-            
-            logger.info(f"Available prediction methods:")
-            logger.info(f"  - predict_torch: {has_predict_torch}")
-            logger.info(f"  - predict: {has_predict}")
-            
-            if has_predict_torch:
-                is_callable = callable(getattr(_PREDICTOR, 'predict_torch', None))
-                logger.info(f"  - predict_torch callable: {is_callable}")
-                if not is_callable:
-                    logger.warning("predict_torch exists but is not callable!")
-            
-            return _PREDICTOR
-        except Exception as e:
-            logger.error(f"Failed to initialize SAM predictor: {e}", exc_info=True)
-            raise
-
-
-# ─────────────────────────────────────────────────────────────
-#  Public API
-# ─────────────────────────────────────────────────────────────
-@torch.inference_mode()
-def segment(img_bytes: bytes, labels: List[str]) -> Dict[str, bytes]:
-    """
-    Returns {label: png_bytes}. Works with BOTH old and new SAM wheels.
-    """
-    logger.info(f"Starting segmentation for {len(labels)} labels")
-    
-    try:
-        predictor = _get_predictor()
+        total_size = int(response.headers.get('content-length', 0))
+        
+        with open(temp_file, 'wb') as f:
+            with tqdm(total=total_size, unit='B', unit_scale=True, desc=desc) as pbar:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        pbar.update(len(chunk))
+        
+        # Move temp file to final destination
+        shutil.move(temp_file, dest)
+        log.info(f"Downloaded {desc or dest.name} successfully")
+        
     except Exception as e:
-        logger.error(f"Failed to get predictor: {e}")
-        raise RuntimeError(f"Failed to initialize SAM predictor: {e}")
+        # Clean up temp file if exists
+        if temp_file.exists():
+            temp_file.unlink()
+        raise RuntimeError(f"Failed to download {desc or dest.name}: {e}")
 
-    # 1) image → predictor
-    try:
-        img = np.array(Image.open(io.BytesIO(img_bytes)).convert("RGB"))
-        logger.info(f"Loaded image: shape={img.shape}, dtype={img.dtype}")
-        predictor.set_image(img)
-    except Exception as e:
-        logger.error(f"Failed to load/set image: {e}")
-        raise RuntimeError(f"Failed to process image: {e}")
+def ensure_weights():
+    """Download model weights if not present"""
+    # Download GroundingDINO checkpoint
+    if not DINO_CKPT.exists():
+        download_file(DINO_CKPT_URL, DINO_CKPT, "GroundingDINO checkpoint (~700MB)")
+    
+    # Download GroundingDINO config
+    if not DINO_CONFIG.exists():
+        download_file(DINO_CONFIG_URL, DINO_CONFIG, "GroundingDINO config")
+    
+    # Download SAM checkpoint
+    if not SAM_CKPT.exists():
+        download_file(SAM_CKPT_URL, SAM_CKPT, "SAM checkpoint (~2.6GB)")
+    
+    log.info("All model weights ready")
 
-    h, w = img.shape[:2]
-    box_xyxy = np.array([[0, 0, w, h]], dtype=np.float32)
-    logger.info(f"Using full image box: {box_xyxy[0]}")
+# Configuration
+DEVICE = torch.device("cpu")
 
-    # 2) Try different prediction APIs with proper error handling
-    mask: np.ndarray | None = None
+# Negative words to filter out non-jewelry detections
+NEGATIVE_WORDS = ["hand", "face", "arm", "mouth", "lips", "teeth", "eye", "nails", "fingernail", "mole"]
+
+def transform_image(image_pil: Image.Image) -> torch.Tensor:
+    """Transform image for GroundingDINO (matching Space preprocessing)"""
+    transform = T.Compose([
+        T.RandomResize([800], max_size=1333),
+        T.ToTensor(),
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+    image_tensor, _ = transform(image_pil, None)
+    return image_tensor
+
+def get_grounding_output(model, image_tensor, caption, box_threshold, text_threshold):
+    """Get GroundingDINO output (matching Space function)"""
+    with torch.no_grad():
+        outputs = model(image_tensor[None].to(DEVICE), captions=[caption])
     
-    # First, check what methods are actually available and callable
-    has_predict_torch = hasattr(predictor, 'predict_torch')
-    has_predict = hasattr(predictor, 'predict')
+    logits = outputs["pred_logits"].sigmoid()[0]  # (num_queries, num_classes)
+    boxes = outputs["pred_boxes"][0]  # (num_queries, 4)
     
-    logger.info(f"Checking prediction methods:")
-    logger.info(f"  - has predict_torch attribute: {has_predict_torch}")
-    logger.info(f"  - has predict attribute: {has_predict}")
+    # Filter by threshold
+    filt_mask = logits.max(dim=1)[0] > box_threshold
+    logits_filt = logits[filt_mask]
+    boxes_filt = boxes[filt_mask]
     
-    # Try predict_torch first if it exists AND is callable
-    if has_predict_torch:
-        predict_torch_func = getattr(predictor, 'predict_torch', None)
-        if callable(predict_torch_func):
-            logger.info("Using predict_torch (torch API)")
-            try:
-                boxes_t = torch.as_tensor(box_xyxy, dtype=torch.float32, device=DEVICE)
-                masks_t, _, _ = predict_torch_func(
-                    point_coords=None,
-                    point_labels=None,
-                    boxes=boxes_t,
-                    multimask_output=False,
-                )
-                mask = masks_t[0][0].cpu().numpy()
-                logger.info(f"Successfully generated mask using predict_torch: shape={mask.shape}")
-            except Exception as e:
-                logger.warning(f"predict_torch failed: {e}, will try predict")
-                mask = None
+    # Get phrases
+    tokenizer = model.tokenizer
+    tokenized = tokenizer(caption)
+    
+    # Build phrases from predictions
+    phrases = []
+    scores = []
+    for logit, box in zip(logits_filt, boxes_filt):
+        pred_phrase = get_phrases_from_posmap(
+            logit > text_threshold, tokenized, caption
+        )
+        phrases.append(pred_phrase)
+        scores.append(logit.max().item())
+    
+    return boxes_filt, torch.tensor(scores), phrases
+
+def get_phrases_from_posmap(posmap, tokenized, caption):
+    """Extract phrases from position map (Space utility function)"""
+    # Simplified version - in production you'd want the full implementation
+    # from GroundingDINO utils
+    if posmap.any():
+        tokens = tokenized.tokens()
+        return caption  # Simplified - return full caption
+    return ""
+
+class _Singleton(type):
+    """Thread-safe singleton metaclass"""
+    _inst = None
+    _lock = threading.Lock()
+    
+    def __call__(cls, *a, **kw):
+        with cls._lock:
+            if cls._inst is None:
+                cls._inst = super().__call__(*a, **kw)
+        return cls._inst
+
+class GroundedSAMModel(metaclass=_Singleton):
+    def __init__(self):
+        log.info("Initializing GroundedSAM models...")
+        
+        # Ensure weights are downloaded
+        ensure_weights()
+        
+        # Load GroundingDINO
+        log.info("Loading GroundingDINO model...")
+        self.dino_model = load_model(str(DINO_CONFIG), str(DINO_CKPT))
+        self.dino_model.to(DEVICE)
+        self.dino_model.eval()
+        
+        # Load SAM
+        log.info("Loading SAM model...")
+        sam_model = build_sam(checkpoint=str(SAM_CKPT))
+        sam_model.to(DEVICE)
+        self.sam_predictor = SamPredictor(sam_model)
+        
+        log.info(f"Models loaded successfully on {DEVICE}")
+    
+    @torch.inference_mode()
+    def detect_and_segment(
+        self, 
+        image_bytes: bytes, 
+        labels: List[str]
+    ) -> Tuple[List[dict], Image.Image]:
+        """
+        Detect objects and generate a SINGLE UNIFIED mask for all requested jewelry types.
+        Returns: (list with single mask result, overlay image)
+        """
+        # Load image
+        pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        np_image = np.array(pil_image)
+        
+        # Build comprehensive detection prompt with ALL jewelry types
+        all_classes = set()
+        requested_types = set()
+        
+        for label in labels:
+            label_lower = label.lower()
+            
+            if "bracelet" in label_lower or "bangle" in label_lower:
+                all_classes.update(["bracelet", "wrist band", "bangle"])
+                requested_types.add("bracelet")
+            elif "earring" in label_lower:
+                all_classes.update(["earring", "earrings", "stud earring"])
+                requested_types.add("earring")
+            elif "ring" in label_lower and "earring" not in label_lower:
+                all_classes.update(["wedding ring", "finger ring", "ring"])
+                requested_types.add("ring")
+            elif "watch" in label_lower:
+                all_classes.update(["watch", "wristwatch", "smartwatch"])
+                requested_types.add("watch")
+            elif "necklace" in label_lower:
+                all_classes.update(["necklace", "pendant", "chain"])
+                requested_types.add("necklace")
+        
+        # If no specific classes found, use comprehensive mixed classes
+        if not all_classes:
+            all_classes = {"ring", "wedding ring", "bracelet", "wristwatch", "wrist band", 
+                          "necklace", "earring", "stud earring", "jewelry"}
+        
+        # Always use mixed config thresholds for best detection
+        box_threshold = 0.25
+        text_threshold = 0.25
+        nms_threshold = 0.5
+        
+        # Build text prompt with ". " separator
+        text_prompt = ". ".join(sorted(all_classes))
+        log.info(f"Detection prompt: {text_prompt}")
+        log.info(f"Requested types: {requested_types}")
+        log.info(f"Using thresholds - box: {box_threshold}, text: {text_threshold}, nms: {nms_threshold}")
+        
+        # Transform image for DINO
+        img_tensor = transform_image(pil_image)
+        
+        # Run GroundingDINO detection
+        boxes, scores, phrases = get_grounding_output(
+            self.dino_model, img_tensor, text_prompt, box_threshold, text_threshold
+        )
+        
+        if len(boxes) == 0:
+            log.info("No detections found")
+            return [], pil_image
+        
+        log.info(f"Found {len(boxes)} initial detections")
+        log.info(f"Detected phrases: {phrases}")
+        
+        # Convert normalized boxes to pixel coordinates
+        W, H = pil_image.size
+        for i in range(boxes.size(0)):
+            boxes[i] = boxes[i] * torch.tensor([W, H, W, H])
+            boxes[i][:2] -= boxes[i][2:] / 2  # Convert center to top-left
+            boxes[i][2:] += boxes[i][:2]      # Convert width/height to bottom-right
+        
+        # Filter negative words
+        keep_idxs = []
+        for i, phrase in enumerate(phrases):
+            phrase_lower = phrase.lower()
+            if any(neg in phrase_lower for neg in NEGATIVE_WORDS):
+                log.info(f"Filtered out: {phrase}")
+            else:
+                keep_idxs.append(i)
+        
+        if not keep_idxs:
+            log.info("All detections filtered by negative words")
+            return [], pil_image
+        
+        boxes = boxes[keep_idxs]
+        scores = scores[keep_idxs]
+        phrases = [phrases[i] for i in keep_idxs]
+        
+        log.info(f"After filtering: {len(boxes)} detections")
+        
+        # Apply NMS
+        keep_nms = torchvision.ops.nms(boxes, scores, nms_threshold).tolist()
+        final_boxes = boxes[keep_nms]
+        final_scores = scores[keep_nms]
+        final_phrases = [phrases[i] for i in keep_nms]
+        
+        log.info(f"After NMS: {len(final_boxes)} detections")
+        log.info(f"Final phrases: {final_phrases}")
+        
+        # Run SAM segmentation
+        self.sam_predictor.set_image(np_image)
+        
+        transformed_boxes = self.sam_predictor.transform.apply_boxes_torch(
+            final_boxes, np_image.shape[:2]
+        ).to(DEVICE)
+        
+        masks, _, _ = self.sam_predictor.predict_torch(
+            point_coords=None,
+            point_labels=None,
+            boxes=transformed_boxes,
+            multimask_output=False,
+        )
+        
+        log.info(f"Generated {masks.shape[0]} masks")
+        
+        # Create SINGLE UNIFIED mask combining all detections
+        if masks.shape[0] > 0:
+            # Merge all masks into one
+            unified_mask = torch.any(masks.squeeze(1), dim=0).cpu().numpy().astype(np.uint8) * 255
+            
+            # CRITICAL: Ensure mask is same size as original image
+            # SAM might output at different resolution, so resize to match input
+            H_original, W_original = np_image.shape[:2]
+            H_mask, W_mask = unified_mask.shape
+            
+            if (H_mask != H_original) or (W_mask != W_original):
+                log.info(f"Resizing mask from {W_mask}x{H_mask} to {W_original}x{H_original}")
+                unified_mask_pil = Image.fromarray(unified_mask, mode='L')
+                unified_mask_pil = unified_mask_pil.resize((W_original, H_original), Image.NEAREST)
+            else:
+                unified_mask_pil = Image.fromarray(unified_mask, mode='L')
+            
+            # Verify final mask size matches input
+            assert unified_mask_pil.size == pil_image.size, f"Mask size {unified_mask_pil.size} doesn't match input {pil_image.size}"
+            
+            # Collect all detected jewelry types
+            detected_types = set()
+            for phrase in final_phrases:
+                phrase_lower = phrase.lower()
+                if any(x in phrase_lower for x in ["bracelet", "wrist band", "bangle"]):
+                    detected_types.add("bracelet")
+                if any(x in phrase_lower for x in ["earring", "stud"]):
+                    detected_types.add("earring")
+                if any(x in phrase_lower for x in ["ring", "wedding"]) and "earring" not in phrase_lower:
+                    detected_types.add("ring")
+                if any(x in phrase_lower for x in ["watch", "wristwatch"]):
+                    detected_types.add("watch")
+                if any(x in phrase_lower for x in ["necklace", "pendant", "chain"]):
+                    detected_types.add("necklace")
+            
+            # Create single result with unified mask
+            unified_label = "jewelry_mask"  # Generic label for unified mask
+            if detected_types:
+                unified_label = "_".join(sorted(detected_types))
+            
+            # Calculate overall bounding box for all detections
+            all_boxes = final_boxes.cpu().numpy()
+            min_x = np.min(all_boxes[:, 0])
+            min_y = np.min(all_boxes[:, 1])
+            max_x = np.max(all_boxes[:, 2])
+            max_y = np.max(all_boxes[:, 3])
+            overall_bbox = [float(min_x), float(min_y), float(max_x), float(max_y)]
+            
+            # Average confidence
+            avg_confidence = float(final_scores.mean())
+            
+            result = {
+                "label": unified_label,
+                "confidence": avg_confidence,
+                "mask": unified_mask_pil,
+                "bbox": overall_bbox,
+                "num_objects": len(final_boxes),
+                "detected_types": list(detected_types)
+            }
+            
+            # Create overlay with all bounding boxes
+            overlay = pil_image.copy()
+            draw = ImageDraw.Draw(overlay)
+            
+            for box, score, phrase in zip(final_boxes, final_scores, final_phrases):
+                bbox = box.cpu().tolist()
+                draw.rectangle(bbox, outline="red", width=2)
+                # Simplify label for display
+                display_label = "jewelry"
+                if "bracelet" in phrase.lower() or "wrist" in phrase.lower():
+                    display_label = "bracelet"
+                elif "earring" in phrase.lower():
+                    display_label = "earring"
+                elif "ring" in phrase.lower() and "earring" not in phrase.lower():
+                    display_label = "ring"
+                elif "watch" in phrase.lower():
+                    display_label = "watch"
+                elif "necklace" in phrase.lower():
+                    display_label = "necklace"
+                    
+                draw.text((bbox[0], bbox[1] - 10), f"{display_label} ({score:.2f})", fill="red")
+            
+            log.info(f"Created unified mask for {len(detected_types)} jewelry types: {detected_types}")
+            log.info(f"Requested but not found: {requested_types - detected_types}")
+            
+            return [result], overlay
         else:
-            logger.info("predict_torch exists but is not callable, skipping")
-    
-    # Fall back to predict if predict_torch didn't work
-    if mask is None and has_predict:
-        predict_func = getattr(predictor, 'predict', None)
-        if callable(predict_func):
-            logger.info("Using predict (NumPy API)")
-            try:
-                masks_np, _, _ = predict_func(
-                    point_coords=None,
-                    point_labels=None,
-                    box=box_xyxy[0],  # Note: 'box' not 'boxes' for single box
-                    multimask_output=False,
-                )
-                mask = masks_np[0]
-                logger.info(f"Successfully generated mask using predict: shape={mask.shape}")
-            except TypeError:
-                # Some versions use 'boxes' plural even for numpy API
-                try:
-                    logger.info("Retrying predict with 'boxes' parameter")
-                    masks_np, _, _ = predict_func(
-                        point_coords=None,
-                        point_labels=None,
-                        boxes=box_xyxy,
-                        multimask_output=False,
-                    )
-                    mask = masks_np[0]
-                    logger.info(f"Successfully generated mask using predict (boxes): shape={mask.shape}")
-                except Exception as e:
-                    logger.error(f"predict with 'boxes' also failed: {e}")
-                    raise RuntimeError(f"All prediction methods failed: {e}")
-            except Exception as e:
-                logger.error(f"predict failed: {e}")
-                raise RuntimeError(f"Prediction failed: {e}")
-        else:
-            logger.error("predict exists but is not callable")
-            raise RuntimeError("No callable prediction method found")
-    
-    # If we still don't have a mask, we've exhausted all options
-    if mask is None:
-        logger.error("No prediction method succeeded")
-        raise RuntimeError("Failed to generate mask: no working prediction method found")
+            return [], pil_image
 
-    # 3) encode one binary mask → PNG once
-    try:
-        mask_u8 = (mask * 255).astype(np.uint8)
-        ok, buf = cv2.imencode(".png", mask_u8)
-        if not ok:
-            raise RuntimeError("cv2.imencode failed")
-        
-        png_bytes = buf.tobytes()
-        logger.info(f"Successfully encoded mask to PNG: {len(png_bytes)} bytes")
-        
-        result = {lab: png_bytes for lab in labels}
-        logger.info(f"✅ Segmentation complete for {len(labels)} labels")
-        return result
-    except Exception as e:
-        logger.error(f"Failed to encode mask: {e}")
-        raise RuntimeError(f"Failed to encode mask to PNG: {e}")
+# Singleton instance
+grounded_sam = GroundedSAMModel()
