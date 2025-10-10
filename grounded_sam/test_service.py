@@ -1,185 +1,226 @@
-#!/usr/bin/env python
-"""
-grounded_sam – endpoint tester + mask downloader
-================================================
-• Supports local files **and remote image URLs**.
-• Optional mask download (azure credentials required).
-"""
 from __future__ import annotations
-
-import argparse
-import asyncio
-import base64
-import json
-import os
-import sys
-import time
-from datetime import datetime, timezone
+import argparse, asyncio, base64, json, os, statistics, time, sys
+from datetime import datetime
+from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Tuple
-from urllib.parse import unquote, urlparse
+from typing import Any, Dict, List, Tuple
 
+import aiofiles
 import httpx
+from PIL import Image
 
-# ──────────────────────────────────────────────────────────────
-#  Azure helpers  (mask download + optional azure:// image arg)
-# ──────────────────────────────────────────────────────────────
-_ACC = os.getenv("AZURE_ACCOUNT_NAME")
-_KEY = os.getenv("AZURE_ACCOUNT_KEY")
-_CONN = os.getenv("AZURE_BLOB_CONN") or (
-    f"DefaultEndpointsProtocol=https;"
-    f"AccountName={_ACC};"
-    f"AccountKey={_KEY};"
-    f"EndpointSuffix=core.windows.net"
-)
-_CONTAINER = os.getenv("AZURE_CONTAINER", "agentic-artifacts")
-_BLOB_CLI = None
 
-async def _azure_client():
-    global _BLOB_CLI
-    if _BLOB_CLI is None:
-        from azure.storage.blob.aio import BlobServiceClient
-        if not (_ACC and _KEY):
-            raise RuntimeError("Azure creds missing (AZURE_ACCOUNT_NAME / KEY)")
-        _BLOB_CLI = BlobServiceClient.from_connection_string(_CONN)
-    return _BLOB_CLI
+try:
+    from azure.storage.blob.aio import BlobServiceClient
+except ImportError:  # pragma: no cover
+    BlobServiceClient = None  # type: ignore
 
-async def _download_blob(uri: str) -> bytes:
-    # uri = azure://container/blob_path w/ optional URL-encoded chars
-    if not uri.startswith("azure://"):
-        raise ValueError("only azure:// URIs")
-    _, _, rest = uri.partition("azure://")
-    cont, _, blob = rest.partition("/")
-    blob = unquote(blob)
-    cli = await _azure_client()
-    stream = await cli.get_blob_client(cont, blob).download_blob()
-    return await stream.readall()
 
-# ──────────────────────────────────────────────────────────────
-#  Input loader  (local path | http(s) | azure://)
-# ──────────────────────────────────────────────────────────────
-async def _load_image_bytes(src: str) -> bytes:
-    parsed = urlparse(src)
-    if parsed.scheme in ("http", "https"):             # remote URL
-        async with httpx.AsyncClient(timeout=60) as cli:
-            r = await cli.get(src)
+# ═════════════════════════════════════════════
+#  Tester
+# ═════════════════════════════════════════════
+class GroundedSAMTester:
+    def __init__(self, service_url: str, output_dir: str):
+        self.service_url = service_url.rstrip("/")
+        self.base = Path(output_dir)
+        for sub in ("inputs", "masks", "overlays"):
+            (self.base / sub).mkdir(parents=True, exist_ok=True)
+
+        self.azure_client = self._make_azure_client()
+
+    @staticmethod
+    def _make_azure_client():
+        acc = os.getenv("AZURE_ACCOUNT_NAME")
+        key = os.getenv("AZURE_ACCOUNT_KEY")
+        if acc and key and BlobServiceClient:
+            conn = (
+                f"DefaultEndpointsProtocol=https;AccountName={acc};"
+                f"AccountKey={key};EndpointSuffix=core.windows.net"
+            )
+            print(f"✓ Azure client configured for account: {acc}")
+            return BlobServiceClient.from_connection_string(conn)
+        print("⚠ Azure credentials not available – artifact download disabled")
+        return None
+
+    async def _download_artifact(self, art: Dict[str, Any]) -> bytes:
+        if not self.azure_client:
+            raise RuntimeError("Azure client not configured")
+        uri = art["uri"].replace("azure://", "")
+        container, blob = uri.split("/", 1)
+        stream = await self.azure_client.get_blob_client(container, blob).download_blob()
+        return await stream.readall()
+
+    async def _download_url(self, url: str) -> bytes:
+        async with httpx.AsyncClient(follow_redirects=True) as cli:
+            r = await cli.get(url)
             r.raise_for_status()
             return r.content
-    elif parsed.scheme == "azure":
-        return await _download_blob(src)
-    else:                                              # assume local path
-        path = Path(src).expanduser()
-        if not path.exists():
-            raise FileNotFoundError(f"{path} not found")
-        return path.read_bytes()
 
-# ──────────────────────────────────────────────────────────────
-#  Mask saver
-# ──────────────────────────────────────────────────────────────
-MASK_DIR = Path("./masks")
-MASK_DIR.mkdir(exist_ok=True)
-
-async def _save_masks(artifacts: Dict[str, Dict[str, str]]) -> None:
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    for label, art in artifacts.items():
-        try:
-            png = await _download_blob(art["uri"])
-        except Exception as exc:
-            print(f"✖ fetch {art['uri']}: {exc}")
-            continue
-        out = MASK_DIR / f"{ts}_{label}.png"
-        out.write_bytes(png)
-        print(f"✓ saved {out}")
-
-# ──────────────────────────────────────────────────────────────
-#  Request helper
-# ──────────────────────────────────────────────────────────────
-def _b64(data: bytes) -> str:
-    return base64.b64encode(data).decode("ascii")
-
-async def _fire(
-    cli: httpx.AsyncClient,
-    url: str,
-    img_b64: str,
-    labels: List[str],
-    idx: int,
-    save_masks: bool,
-) -> Tuple[int, float]:
-    payload = {"data": {"image_bytes": img_b64, "labels": labels}}
-    t0 = time.perf_counter()
-    r = await cli.post(url, json=payload)
-    ms = (time.perf_counter() - t0) * 1000
-
-    if idx == 0:
-        body = r.json()
-        print(json.dumps(body, indent=2)[:300] + " …")
-        if save_masks and r.status_code == 200:
-            await _save_masks(body["artifacts"])
-    return r.status_code, ms
-
-# ──────────────────────────────────────────────────────────────
-#  Orchestrator
-# ──────────────────────────────────────────────────────────────
-async def _run(
-    mode: str,
-    img_src: str,
-    labels: List[str],
-    url: str,
-    n: int,
-    save_masks: bool,
-) -> None:
-    img_bytes = await _load_image_bytes(img_src)
-    img_b64   = _b64(img_bytes)
-
-    async with httpx.AsyncClient(timeout=120) as cli:
-        if mode == "single":
-            code, ms = await _fire(cli, url, img_b64, labels, 0, save_masks)
-            print(f"{img_src}: {code}  ({ms:.1f} ms)")
+    async def _load_image(self, src: str) -> Tuple[bytes, Image.Image]:
+        if src.startswith(("http://", "https://")):
+            raw = await self._download_url(src)
         else:
-            jobs = [
-                _fire(cli, url, img_b64, labels, i, save_masks and i == 0)
-                for i in range(n)
-            ]
+            async with aiofiles.open(src, "rb") as f:
+                raw = await f.read()
+        return raw, Image.open(BytesIO(raw))
+
+    @staticmethod
+    def _b64(data: bytes) -> str:
+        return base64.b64encode(data).decode()
+
+    async def test_single(self, img_src: str, labels: List[str], tag: str = "single"):
+        raw, pil_img = await self._load_image(img_src)
+        (self.base / "inputs" / f"{tag}.png").write_bytes(raw)
+
+        payload = {
+            "data": {"labels": labels, "image_bytes": self._b64(raw)},
+            "meta": {"test_case": tag, "ts": datetime.utcnow().isoformat()},
+        }
+
+        async with httpx.AsyncClient(timeout=90.0) as cli:
             t0 = time.perf_counter()
-            res = await asyncio.gather(*jobs, return_exceptions=True)
-            wall = time.perf_counter() - t0
+            res = await cli.post(f"{self.service_url}/run", json=payload)
+            latency = (time.perf_counter() - t0) * 1000
 
-            codes = [c for c, _ in res if isinstance(c, int)]
-            lats  = [ms for _, ms in res if not isinstance(ms, Exception)]
-            ok = codes.count(200)
-            p50 = sorted(lats)[len(lats)//2] if lats else float("nan")
-            avg = sum(lats)/len(lats) if lats else float("nan")
-            print(
-                f"{n} requests → {ok}/{n} OK  "
-                f"p50={p50:.1f} ms  avg={avg:.1f} ms  wall={wall:.2f}s"
+        if res.status_code != 200:
+            print(f"✗ {tag}: {res.status_code} – {res.text[:120]}")
+            return None
+
+        out = res.json()
+        print(f"✓ {tag}: {out['status']}  ({latency:.1f} ms)")
+
+        if out.get("masks") and self.azure_client:
+            m = out["masks"][0]
+            mb = await self._download_artifact(m["mask_artifact"])
+            Image.open(BytesIO(mb)).save(self.base / "masks" / f"{tag}_{m['label']}.png")
+
+        if out.get("overlay_artifact") and self.azure_client:
+            ob = await self._download_artifact(out["overlay_artifact"])
+            Image.open(BytesIO(ob)).save(self.base / "overlays" / f"{tag}.png")
+
+        return out
+
+    async def test_batch(self, imgs: List[str], labels: List[str], tag: str = "batch"):
+        results = await asyncio.gather(
+            *[self.test_single(src, labels, f"{tag}_{i}") for i, src in enumerate(imgs)],
+            return_exceptions=True,
+        )
+        ok = sum(isinstance(r, dict) for r in results)
+        print(f"Batch finished – {ok}/{len(imgs)} succeeded")
+
+    async def test_with_classifier_output(self, img_src: str):
+        """Simulate the end-to-end flow *after* the jewelry-classifier."""
+        raw, _ = await self._load_image(img_src)
+        classifier_payload = {
+            # NEW preferred field:
+            "detected_jewelry": ["ring", "bracelet"],
+            # …but the service still supports this legacy key:
+            "jewelry-classify": ["ring", "bracelet"],
+            "image_bytes": self._b64(raw),
+        }
+
+        async with httpx.AsyncClient(timeout=90.0) as cli:
+            res = await cli.post(
+                f"{self.service_url}/run",
+                json={"data": classifier_payload, "meta": {"test_case": "classifier"}},
             )
+        msg = res.json().get("status", "??")
+        print(f"Classifier→SAM status: {msg}")
 
-    if _BLOB_CLI:
-        await _BLOB_CLI.close()
+    # ─────────── load / flood test ───────────
+    async def flood_test(
+        self,
+        img_src: str,
+        labels: List[str],
+        concurrency: int,
+        repeat: int,
+    ):
+        raw, _ = await self._load_image(img_src)
+        body = json.dumps(
+            {"data": {"labels": labels, "image_bytes": self._b64(raw)}}
+        ).encode()
 
-# ──────────────────────────────────────────────────────────────
-#  CLI
-# ──────────────────────────────────────────────────────────────
-if __name__ == "__main__":
+        lat, codes = [], []
+        sem = asyncio.Semaphore(concurrency)
+
+        async def send(i: int):
+            async with sem:
+                t0 = time.perf_counter()
+                async with httpx.AsyncClient(timeout=120.0) as cli:
+                    r = await cli.post(
+                        f"{self.service_url}/run",
+                        content=body,
+                        headers={"Content-Type": "application/json"},
+                    )
+                lat.append((time.perf_counter() - t0) * 1000)
+                codes.append(r.status_code)
+                if (i + 1) % 10 == 0:
+                    print(f" … {i + 1}/{repeat} done", flush=True)
+
+        print(f"Flood → {repeat} requests, ≤{concurrency} concurrent")
+        await asyncio.gather(*[asyncio.create_task(send(i)) for i in range(repeat)])
+
+        ok = codes.count(200)
+        p50 = statistics.median(lat)
+        p95 = statistics.quantiles(lat, n=20)[18] if len(lat) >= 20 else max(lat)
+        print(
+            f"\n{ok}/{repeat} succeeded   "
+            f"p50={p50:.1f} ms  p95={p95:.1f} ms  max={max(lat):.1f} ms"
+        )
+
+    async def health(self) -> bool:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as cli:
+                r = await cli.get(f"{self.service_url}/health")
+            if r.status_code == 200:
+                print("✓ service healthy", r.json().get("workers", {}))
+                return True
+        except Exception as exc:
+            print("✗ health check failed:", exc)
+        return False
+
+async def _cli():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["single", "multi"])
-    ap.add_argument("image", help="local path, http(s) URL, or azure:// URI")
-    ap.add_argument("-n", "--concurrency", type=int, default=10)
-    ap.add_argument("--url", default="http://localhost:18007/run")
-    ap.add_argument("--labels", nargs="+", required=True)
-    ap.add_argument("--save-masks", action="store_true")
+    ap.add_argument("--service-url", default="http://localhost:18007")
+    ap.add_argument("--output-dir", default="test_outputs")
+    ap.add_argument(
+        "--mode",
+        choices=["single", "batch", "both", "flood"],
+        default="single",
+    )
+    ap.add_argument(
+        "--images",
+        nargs="+",
+        default=["https://images.unsplash.com/photo-1515562141207-7a88fb7ce338?w=800"],
+    )
+    ap.add_argument("--labels", nargs="+", default=["ring", "bracelet", "earring"])
+    ap.add_argument("--concurrency", type=int, default=8)
+    ap.add_argument("--repeat", type=int, default=32)
     args = ap.parse_args()
 
-    try:
-        asyncio.run(
-            _run(
-                args.mode,
-                args.image,
-                args.labels,
-                args.url,
-                args.concurrency,
-                args.save_masks,
-            )
-        )
-    except KeyboardInterrupt:
-        sys.exit(130)
+    tester = GroundedSAMTester(args.service_url, args.output_dir)
+    if not await tester.health():
+        print("Service unhealthy – aborting")
+        return
+
+    if args.mode == "flood":
+        await tester.flood_test(args.images[0], args.labels, args.concurrency, args.repeat)
+        return
+
+    if args.mode in ("single", "both"):
+        await tester.test_single(args.images[0], args.labels, "single")
+
+    if args.mode in ("batch", "both"):
+        if len(args.images) < 2:
+            print("Batch mode needs ≥2 images (use --images …)")
+        else:
+            await tester.test_batch(args.images, args.labels)
+
+    if args.mode == "both":
+        await tester.test_with_classifier_output(args.images[0])
+
+
+if __name__ == "__main__":
+    if sys.version_info < (3, 9):
+        sys.exit("Requires Python 3.9+")
+    asyncio.run(_cli())

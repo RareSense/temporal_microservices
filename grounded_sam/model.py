@@ -1,36 +1,29 @@
 from __future__ import annotations
-import os, io, logging, requests, shutil
+import io, logging, requests, shutil
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple
 import threading
 from tqdm import tqdm
 
 import torch
 import torchvision
-from torchvision.ops import box_convert
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
-import cv2
+from PIL import Image, ImageDraw
 
-# GroundingDINO imports
-from groundingdino.util.inference import load_model, load_image, predict, annotate
+from groundingdino.util.inference import load_model
 import groundingdino.datasets.transforms as T
-
-# SAM imports
 from segment_anything import build_sam, SamPredictor
 
 log = logging.getLogger(__name__)
 
-# Model paths
 ROOT = Path(__file__).parent
-WEIGHTS_DIR = ROOT.parent / "weights"  # Use shared weights directory
+WEIGHTS_DIR = ROOT.parent / "weights" 
 WEIGHTS_DIR.mkdir(exist_ok=True)
 
 DINO_CONFIG = WEIGHTS_DIR / "GroundingDINO_SwinT_OGC.py"
 DINO_CKPT = WEIGHTS_DIR / "groundingdino_swint_ogc.pth"
 SAM_CKPT = WEIGHTS_DIR / "sam_vit_h_4b8939.pth"
 
-# Download URLs
 DINO_CKPT_URL = "https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth"
 DINO_CONFIG_URL = "https://raw.githubusercontent.com/IDEA-Research/GroundingDINO/main/groundingdino/config/GroundingDINO_SwinT_OGC.py"
 SAM_CKPT_URL = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth"
@@ -43,7 +36,6 @@ def download_file(url: str, dest: Path, desc: str = None):
     
     log.info(f"Downloading {desc or dest.name}...")
     
-    # Create temp file first
     temp_file = dest.with_suffix('.tmp')
     
     try:
@@ -59,12 +51,10 @@ def download_file(url: str, dest: Path, desc: str = None):
                         f.write(chunk)
                         pbar.update(len(chunk))
         
-        # Move temp file to final destination
         shutil.move(temp_file, dest)
         log.info(f"Downloaded {desc or dest.name} successfully")
         
     except Exception as e:
-        # Clean up temp file if exists
         if temp_file.exists():
             temp_file.unlink()
         raise RuntimeError(f"Failed to download {desc or dest.name}: {e}")
@@ -92,7 +82,7 @@ DEVICE = torch.device("cpu")
 NEGATIVE_WORDS = ["hand", "face", "arm", "mouth", "lips", "teeth", "eye", "nails", "fingernail", "mole"]
 
 def transform_image(image_pil: Image.Image) -> torch.Tensor:
-    """Transform image for GroundingDINO (matching Space preprocessing)"""
+    """Transform image for GroundingDINO"""
     transform = T.Compose([
         T.RandomResize([800], max_size=1333),
         T.ToTensor(),
@@ -102,23 +92,21 @@ def transform_image(image_pil: Image.Image) -> torch.Tensor:
     return image_tensor
 
 def get_grounding_output(model, image_tensor, caption, box_threshold, text_threshold):
-    """Get GroundingDINO output (matching Space function)"""
+    """Get GroundingDINO output"""
     with torch.no_grad():
         outputs = model(image_tensor[None].to(DEVICE), captions=[caption])
     
-    logits = outputs["pred_logits"].sigmoid()[0]  # (num_queries, num_classes)
-    boxes = outputs["pred_boxes"][0]  # (num_queries, 4)
+    logits = outputs["pred_logits"].sigmoid()[0]  
+    boxes = outputs["pred_boxes"][0] 
     
     # Filter by threshold
     filt_mask = logits.max(dim=1)[0] > box_threshold
     logits_filt = logits[filt_mask]
     boxes_filt = boxes[filt_mask]
     
-    # Get phrases
     tokenizer = model.tokenizer
     tokenized = tokenizer(caption)
     
-    # Build phrases from predictions
     phrases = []
     scores = []
     for logit, box in zip(logits_filt, boxes_filt):
@@ -132,15 +120,14 @@ def get_grounding_output(model, image_tensor, caption, box_threshold, text_thres
 
 def get_phrases_from_posmap(posmap, tokenized, caption):
     """Extract phrases from position map (Space utility function)"""
-    # Simplified version - in production you'd want the full implementation
+    # Simplified version - in production use the full implementation
     # from GroundingDINO utils
     if posmap.any():
         tokens = tokenized.tokens()
-        return caption  # Simplified - return full caption
+        return caption 
     return ""
 
 class _Singleton(type):
-    """Thread-safe singleton metaclass"""
     _inst = None
     _lock = threading.Lock()
     
@@ -154,16 +141,13 @@ class GroundedSAMModel(metaclass=_Singleton):
     def __init__(self):
         log.info("Initializing GroundedSAM models...")
         
-        # Ensure weights are downloaded
         ensure_weights()
-        
-        # Load GroundingDINO
+
         log.info("Loading GroundingDINO model...")
         self.dino_model = load_model(str(DINO_CONFIG), str(DINO_CKPT))
         self.dino_model.to(DEVICE)
         self.dino_model.eval()
-        
-        # Load SAM
+
         log.info("Loading SAM model...")
         sam_model = build_sam(checkpoint=str(SAM_CKPT))
         sam_model.to(DEVICE)
@@ -177,15 +161,10 @@ class GroundedSAMModel(metaclass=_Singleton):
         image_bytes: bytes, 
         labels: List[str]
     ) -> Tuple[List[dict], Image.Image]:
-        """
-        Detect objects and generate a SINGLE UNIFIED mask for all requested jewelry types.
-        Returns: (list with single mask result, overlay image)
-        """
-        # Load image
+
         pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         np_image = np.array(pil_image)
-        
-        # Build comprehensive detection prompt with ALL jewelry types
+
         all_classes = set()
         requested_types = set()
         
@@ -208,26 +187,21 @@ class GroundedSAMModel(metaclass=_Singleton):
                 all_classes.update(["necklace", "pendant", "chain"])
                 requested_types.add("necklace")
         
-        # If no specific classes found, use comprehensive mixed classes
         if not all_classes:
             all_classes = {"ring", "wedding ring", "bracelet", "wristwatch", "wrist band", 
                           "necklace", "earring", "stud earring", "jewelry"}
         
-        # Always use mixed config thresholds for best detection
         box_threshold = 0.25
         text_threshold = 0.25
         nms_threshold = 0.5
         
-        # Build text prompt with ". " separator
         text_prompt = ". ".join(sorted(all_classes))
         log.info(f"Detection prompt: {text_prompt}")
         log.info(f"Requested types: {requested_types}")
         log.info(f"Using thresholds - box: {box_threshold}, text: {text_threshold}, nms: {nms_threshold}")
         
-        # Transform image for DINO
         img_tensor = transform_image(pil_image)
         
-        # Run GroundingDINO detection
         boxes, scores, phrases = get_grounding_output(
             self.dino_model, img_tensor, text_prompt, box_threshold, text_threshold
         )
@@ -239,14 +213,12 @@ class GroundedSAMModel(metaclass=_Singleton):
         log.info(f"Found {len(boxes)} initial detections")
         log.info(f"Detected phrases: {phrases}")
         
-        # Convert normalized boxes to pixel coordinates
         W, H = pil_image.size
         for i in range(boxes.size(0)):
             boxes[i] = boxes[i] * torch.tensor([W, H, W, H])
-            boxes[i][:2] -= boxes[i][2:] / 2  # Convert center to top-left
-            boxes[i][2:] += boxes[i][:2]      # Convert width/height to bottom-right
+            boxes[i][:2] -= boxes[i][2:] / 2 
+            boxes[i][2:] += boxes[i][:2]     
         
-        # Filter negative words
         keep_idxs = []
         for i, phrase in enumerate(phrases):
             phrase_lower = phrase.lower()
@@ -290,13 +262,8 @@ class GroundedSAMModel(metaclass=_Singleton):
         
         log.info(f"Generated {masks.shape[0]} masks")
         
-        # Create SINGLE UNIFIED mask combining all detections
         if masks.shape[0] > 0:
-            # Merge all masks into one
             unified_mask = torch.any(masks.squeeze(1), dim=0).cpu().numpy().astype(np.uint8) * 255
-            
-            # CRITICAL: Ensure mask is same size as original image
-            # SAM might output at different resolution, so resize to match input
             H_original, W_original = np_image.shape[:2]
             H_mask, W_mask = unified_mask.shape
             
@@ -310,7 +277,6 @@ class GroundedSAMModel(metaclass=_Singleton):
             # Verify final mask size matches input
             assert unified_mask_pil.size == pil_image.size, f"Mask size {unified_mask_pil.size} doesn't match input {pil_image.size}"
             
-            # Collect all detected jewelry types
             detected_types = set()
             for phrase in final_phrases:
                 phrase_lower = phrase.lower()
@@ -325,12 +291,10 @@ class GroundedSAMModel(metaclass=_Singleton):
                 if any(x in phrase_lower for x in ["necklace", "pendant", "chain"]):
                     detected_types.add("necklace")
             
-            # Create single result with unified mask
-            unified_label = "jewelry_mask"  # Generic label for unified mask
+            unified_label = "jewelry_mask" 
             if detected_types:
                 unified_label = "_".join(sorted(detected_types))
             
-            # Calculate overall bounding box for all detections
             all_boxes = final_boxes.cpu().numpy()
             min_x = np.min(all_boxes[:, 0])
             min_y = np.min(all_boxes[:, 1])
@@ -338,7 +302,6 @@ class GroundedSAMModel(metaclass=_Singleton):
             max_y = np.max(all_boxes[:, 3])
             overall_bbox = [float(min_x), float(min_y), float(max_x), float(max_y)]
             
-            # Average confidence
             avg_confidence = float(final_scores.mean())
             
             result = {
@@ -350,7 +313,6 @@ class GroundedSAMModel(metaclass=_Singleton):
                 "detected_types": list(detected_types)
             }
             
-            # Create overlay with all bounding boxes
             overlay = pil_image.copy()
             draw = ImageDraw.Draw(overlay)
             
@@ -379,5 +341,4 @@ class GroundedSAMModel(metaclass=_Singleton):
         else:
             return [], pil_image
 
-# Singleton instance
 grounded_sam = GroundedSAMModel()

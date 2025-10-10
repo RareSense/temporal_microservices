@@ -1,4 +1,3 @@
-# grounded_sam_service/schemas.py
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional
 
