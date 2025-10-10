@@ -1,5 +1,3 @@
-# app/model.py  — fully self-contained, multiprocess-safe
-# ------------------------------------------------------
 from __future__ import annotations
 
 import io
@@ -15,24 +13,18 @@ import timm
 from PIL import Image
 from torchvision import transforms
 
-# ────────────────────────────────────────────────
-#  Hard-coded / env-override paths & constants
-# ────────────────────────────────────────────────
 ROOT = Path(__file__).parent.parent
 CHECKPOINT_PATH = Path(
      os.getenv("JC_KPT", Path(__file__).parent.parent / "weights" / "best_model.pth")
     )
 IMG_SIZE = 384
 THRESHOLD = float(os.environ.get("JC_THRESHOLD", 0.55))
-DEVICE = "cpu"  # keep CPU-only for now
+DEVICE = "cpu" 
 
-# ────────────────────────────────────────────────
-#  Classes that existed in the training script
-#  (must be import-resolvable during torch.load)
-# ────────────────────────────────────────────────
+
 class TrainingConfig:
     """Dummy holder – attributes are restored by torch.load."""
-    def __init__(self, **kw):  # noqa: D401
+    def __init__(self, **kw):  
         for k, v in kw.items():
             setattr(self, k, v)
 
@@ -45,7 +37,6 @@ class LabelEncoder:
         self.class_to_idx = {c: i for i, c in enumerate(self.classes)}
         self.idx_to_class = {i: c for c, i in self.class_to_idx.items()}
 
-    # Not strictly needed at inference time, but keeps pickle happy.
     def labels_to_vector(self, labels):
         v = torch.zeros(self.num_classes, dtype=torch.float32)
         for lab in labels:
@@ -54,16 +45,12 @@ class LabelEncoder:
         return v
 
 
-#  Make sure torch.load can find these regardless of multiprocess module names
 for alias in ("__main__", "__mp_main__"):
     if alias not in sys.modules:
         sys.modules[alias] = types.ModuleType(alias)
     sys.modules[alias].LabelEncoder = LabelEncoder
     sys.modules[alias].TrainingConfig = TrainingConfig
 
-# ────────────────────────────────────────────────
-#  Model definition (unchanged from training code)
-# ────────────────────────────────────────────────
 class MultiLabelViT(torch.nn.Module):
     def __init__(self, model_name, num_classes, img_size=(384, 384), dropout=0.2):
         super().__init__()
@@ -92,19 +79,15 @@ class MultiLabelViT(torch.nn.Module):
     def forward(self, x):
         feat = self.backbone(x)          
 
-        if feat.ndim == 3:               # ≈ ViT token dim
+        if feat.ndim == 3:              
             feat = feat.mean(dim=1)
-        elif feat.ndim == 4:             # CNN feature-map
+        elif feat.ndim == 4:           
             feat = feat.mean(dim=[2, 3])
-        # ndim == 2 → already (B, D); leave untouched
 
         logits = self.classifier(feat)
         return logits
 
 
-# ────────────────────────────────────────────────
-#  Pre-processing
-# ────────────────────────────────────────────────
 class _PadToSquare:
     def __init__(self, size=IMG_SIZE):
         self.s = size
@@ -128,9 +111,7 @@ _transform = transforms.Compose(
     ]
 )
 
-# ────────────────────────────────────────────────
-#  Thread-safe singleton wrapper
-# ────────────────────────────────────────────────
+
 class _Singleton(type):
     _inst = None
     _lock = threading.Lock()
@@ -145,7 +126,7 @@ class _Singleton(type):
 class Classifier(metaclass=_Singleton):
     def __init__(self):
         ckpt = torch.load(CHECKPOINT_PATH, map_location=DEVICE, weights_only=False)
-        self.le: LabelEncoder = ckpt["label_encoder"]  # type: ignore[assignment]
+        self.le: LabelEncoder = ckpt["label_encoder"]  
         self.model = MultiLabelViT(
             "swin_base_patch4_window12_384", self.le.num_classes, (IMG_SIZE, IMG_SIZE)
         )
@@ -161,5 +142,4 @@ class Classifier(metaclass=_Singleton):
         return [self.le.idx_to_class[i] for i in idxs]
 
 
-#  Singleton instance – imported by FastAPI
 classifier = Classifier()

@@ -1,6 +1,6 @@
 from __future__ import annotations
-import base64, asyncio, json, os
-from typing import Any, Dict, List
+import base64, asyncio, os
+from typing import Any, List
 from concurrent.futures import ThreadPoolExecutor
 
 import structlog
@@ -41,27 +41,18 @@ def _find_artifact(node: Any) -> str | None:
     return None
 
 
-@app.post("/run", response_model=List[str])
+@app.post("/run")
 async def run(req: RunRequest, raw: Request):
     """
-    Returns a **plain list[str]** – jewellery names.
-    Accepts any of:
-      • data.image_bytes  – base-64 jpg/png
-      • data.artifact     – 'azure://container/blob'
-      • data.original_path.uri  (or any nested .uri)
-      • data == Artifact dict itself
+    Returns a dict with detected_jewelry field containing jewelry names.
     """
-
     try:
         if "image_bytes" in req.data:                      
             img_bytes = base64.b64decode(req.data["image_bytes"])
-
         elif "artifact" in req.data:                   
             img_bytes = await fetch_artifact(req.data["artifact"])
-
         elif isinstance(req.data, dict) and "uri" in req.data: 
             img_bytes = await fetch_artifact(req.data["uri"])
-
         else:                                             
             uri = _find_artifact(req.data)
             if not uri:
@@ -76,7 +67,11 @@ async def run(req: RunRequest, raw: Request):
 
     try:
         labels = await _infer(img_bytes)
-        return labels
+        
+        return {
+            "detected_jewelry": labels 
+        }
+        
     except Exception as exc:
         log.error("inference_failed", err=str(exc))
         raise HTTPException(500, f"inference failed: {exc}")
