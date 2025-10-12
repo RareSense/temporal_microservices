@@ -394,3 +394,8 @@ if __name__ == "__main__":
         print("Requires Python 3.9+", file=sys.stderr)
         sys.exit(1)
     main()
+
+
+# Usage:
+#python test_service.py health
+#python test_service.py single
