@@ -115,3 +115,4 @@ websockets==15.0.1
 wheel==0.45.1
 yapf==0.43.0
 yarl==1.22.0
+basicsr @ git+https://github.com/XPixelGroup/BasicSR.git
