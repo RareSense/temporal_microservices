@@ -279,29 +279,40 @@ class FluxTryOnWrapper:
         skin_shade = self._map_skin_tone(skin_raw) if skin_present else None
 
         # 6️⃣ Decide: library vs Gemini
-        use_library = zoom_present and skin_present
         garment_b64: str | None = None
+        provided_garment = data.get("garment")
+        if isinstance(provided_garment, dict) and "uri" in provided_garment:
+            g_bytes = await fetch_artifact(provided_garment["uri"])
+            garment_b64 = base64.b64encode(g_bytes).decode()
+
+        # Decide: library vs Gemini, but skip Gemini if garment already provided
+        use_library = (zoom_present and skin_present and garment_b64 is None)
 
         if not use_library:
-            logger.info("Missing zoom or skin – using Gemini to generate garment image…")
-            gemini_img = await asyncio.get_event_loop().run_in_executor(
-                None, _gemini_generate, orig_pil
-            )
-            gemini_img = _center_crop_and_resize(_pil_to_rgb(gemini_img))
-            buffered = BytesIO()
-            gemini_img.save(buffered, format="PNG", quality=95)
-            garment_b64 = base64.b64encode(buffered.getvalue()).decode()
-            # Provide default fallbacks so Flux can run
-            if zoom_level is None:
-                zoom_level = "bust shot"
-            if skin_shade is None:
-                skin_shade = "medium"
+            if garment_b64:
+                logger.info("Using garment provided by caller – skipping Gemini.")
+                # Provide safe defaults if zoom/skin missing
+                if zoom_level is None:
+                    zoom_level = "bust shot"
+                if skin_shade is None:
+                    skin_shade = "medium"
+            else:
+                logger.info("Missing zoom or skin and no garment provided – using Gemini to generate garment image…")
+                gemini_img = await asyncio.get_event_loop().run_in_executor(
+                    None, _gemini_generate, orig_pil
+                )
+                gemini_img = _center_crop_and_resize(_pil_to_rgb(gemini_img))
+                buffered = BytesIO()
+                gemini_img.save(buffered, format="PNG", quality=95)
+                garment_b64 = base64.b64encode(buffered.getvalue()).decode()
+                if zoom_level is None:
+                    zoom_level = "bust shot"
+                if skin_shade is None:
+                    skin_shade = "medium"
         else:
             logger.info(
                 "Using library garment (zoom=%s, skin=%s, jewelry=%s)",
-                zoom_level,
-                skin_shade,
-                jewelry_type,
+                zoom_level, skin_shade, jewelry_type
             )
 
         # 7️⃣ Prepare Flux request
@@ -319,7 +330,7 @@ class FluxTryOnWrapper:
             "num_steps": 30,
             "guidance_scale": 30.0,
         }
-        if not use_library and garment_b64:
+        if garment_b64:
             flux_req["garment"] = garment_b64
 
         logger.info(
