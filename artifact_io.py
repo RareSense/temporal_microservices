@@ -1,10 +1,10 @@
 from __future__ import annotations
-import os, re
 from azure.storage.blob.aio import BlobServiceClient
 from azure.storage.blob import BlobSasPermissions, generate_blob_sas
 from datetime import datetime
 import uuid
 import hashlib
+import os, re, asyncio
 
 _ACC  = os.getenv("AZURE_ACCOUNT_NAME")
 _KEY  = os.getenv("AZURE_ACCOUNT_KEY")
@@ -51,3 +51,7 @@ async def upload_artifact(data: bytes, mime: str = "application/octet-stream") -
         "bytes": len(data),
         "sha256": hashlib.sha256(data).hexdigest(),
     }
+
+def fetch_artifact_sync(uri: str) -> bytes:
+    """Sync wrapper for Streamlit. Use inside the UI thread."""
+    return asyncio.run(fetch_artifact(uri))

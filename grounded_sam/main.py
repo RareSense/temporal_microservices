@@ -1,4 +1,3 @@
-from __future__ import annotations
 import asyncio, os, base64
 from typing import Any, Dict, List
 from contextlib import asynccontextmanager
