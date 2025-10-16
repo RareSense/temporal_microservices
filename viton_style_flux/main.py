@@ -455,17 +455,9 @@ class QueueManager:
             ghost_image_b64 = ImageProcessor.encode_base64(ghost_image, format="PNG")
             logger.info("Ghost image created with transparent background")
             
-            # # NOW invert the mask for processing
-            # mask_inverted = ImageProcessor.invert_mask(mask_original)
-            # logger.info("Mask inverted for processing")
-
-            # DEBUG: skip inversion so white=edit (use original mask as-is)
-            if mask_original.mode != 'L':
-                mask_inverted = mask_original.convert('L')
-            else:
-                mask_inverted = mask_original
-            logger.info("Mask inversion temporarily DISABLED for debug")
-
+            # NOW invert the mask for processing
+            mask_inverted = ImageProcessor.invert_mask(mask_original)
+            logger.info("Mask inverted for processing")
             import numpy as np
             arr = np.array(mask_inverted)
             logger.info(f"[CORE] mask_inverted stats min={arr.min()} max={arr.max()} mean={arr.mean():.1f}")
