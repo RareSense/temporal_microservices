@@ -458,6 +458,9 @@ class QueueManager:
             # NOW invert the mask for processing
             mask_inverted = ImageProcessor.invert_mask(mask_original)
             logger.info("Mask inverted for processing")
+            import numpy as np
+            arr = np.array(mask_inverted)
+            logger.info(f"[CORE] mask_inverted stats min={arr.min()} max={arr.max()} mean={arr.mean():.1f}")
             
             # Get or select garment
             library_info = None
