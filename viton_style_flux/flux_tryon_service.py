@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import hashlib
 import logging
 import os
 import time
@@ -344,7 +345,6 @@ class FluxTryOnWrapper:
         res.raise_for_status()
         flux_out = res.json()
 
-        import hashlib, base64
         def _h10(b: bytes) -> str:
             return hashlib.sha256(b).hexdigest()[:10]
 
