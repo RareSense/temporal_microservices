@@ -451,22 +451,17 @@ class QueueManager:
             
             # Create ghost image BEFORE inverting the mask
             # Ghost image shows white areas of original mask with transparent bg
-            ghost_keep_mask = ImageProcessor.invert_mask(mask_original)
-            ghost_image = ImageProcessor.create_ghost_image(image, ghost_keep_mask)
-            logger.info("Ghost image created (using INVERTED mask to keep original JEWELRY)")
-            
+            ghost_image = ImageProcessor.create_ghost_image(image, mask_original)
             ghost_image_b64 = ImageProcessor.encode_base64(ghost_image, format="PNG")
-
+            logger.info("Ghost image created with transparent background")
+            
             # NOW invert the mask for processing
             mask_inverted = ImageProcessor.invert_mask(mask_original)
             logger.info("Mask inverted for processing")
-            # Diagnostic prints
             import numpy as np
-            arr_model = np.array(mask_inverted)
-            logger.info(f"[CORE] model_mask stats min={arr_model.min()} max={arr_model.max()} mean={arr_model.mean():.1f}")
-            arr_ghost = np.array(ImageOps.invert(mask_original))
-            logger.info(f"[CORE] ghost_mask stats min={arr_ghost.min()} max={arr_ghost.max()} mean={arr_ghost.mean():.1f}")
-
+            arr = np.array(mask_inverted)
+            logger.info(f"[CORE] mask_inverted stats min={arr.min()} max={arr.max()} mean={arr.mean():.1f}")
+            
             # Get or select garment
             library_info = None
             if request.use_library:
