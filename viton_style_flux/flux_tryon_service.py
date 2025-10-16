@@ -202,7 +202,9 @@ class FluxTryOnWrapper:
 
     # -------------------- main entry -------------------- #
     async def process_tryon(self, data: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Extract inputs, decide library vs Gemini, call Flux, upload results."""
+        """
+        Extract inputs, decide library vs Gemini, call Flux, upload results
+        """
         logger.info("=" * 70)
         logger.info("📥 INCOMING DATA STRUCTURE:")
         logger.info(json.dumps(data, indent=2, default=str)[:1200])
@@ -341,6 +343,18 @@ class FluxTryOnWrapper:
         res = await self.client.post(f"{auto_cfg.FLUX_TRYON_URL}/tryon", json=flux_req)
         res.raise_for_status()
         flux_out = res.json()
+
+        import hashlib, base64
+        def _h10(b: bytes) -> str:
+            return hashlib.sha256(b).hexdigest()[:10]
+
+        try:
+            orig_hash = _h10(image_bytes)
+            v0 = flux_out.get("variations", [])
+            v0_hash = _h10(base64.b64decode(v0[0])) if v0 else "NONE"
+            logger.info(f"[WRAPPER] hash input={orig_hash} var0={v0_hash} count={len(v0)}")
+        except Exception as _e:
+            logger.warning(f"[WRAPPER] hash check failed: {_e}")
 
         # 9️⃣ Upload variations + ghost, emit list
         outputs: List[Dict[str, Any]] = []
